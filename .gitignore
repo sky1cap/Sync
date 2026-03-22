@@ -26,6 +26,7 @@
 *.zip
 tmp/
 .next.bak*/
+/aikeyboard
 
 # debug
 npm-debug.log*
