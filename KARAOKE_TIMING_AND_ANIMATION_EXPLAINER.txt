@@ -1,0 +1,710 @@
+KARAOKE LISTEN
+Timing, Lyric Sync, Animation, and Failure Analysis
+
+Workspace:
+/Users/akashcetorelli/Documents/New project
+
+Main file explained:
+/Users/akashcetorelli/Documents/New project/components/karaoke-listen/karaoke-listen-app.tsx
+
+Purpose of this document
+This file explains how the karaoke timing currently works, how the loading and karaoke animations work, what code controls each part, and what may be failing when the app "does not work right".
+
+This is based on the current live code, not an older draft.
+
+
+==================================================
+1. HIGH-LEVEL FLOW
+==================================================
+
+The app has 5 main phases:
+
+1. idle
+   The user sees the microphone button.
+
+2. listening
+   The app requests microphone access and records about 10 seconds.
+   A live sound level meter also runs so the loading visual can react to sound.
+
+3. recognizing
+   The recorded clip is sent to AudD for song recognition.
+   The code may also create a second shifted clip to improve matching.
+
+4. karaoke
+   The app fetches lyrics from LRCLIB, parses timestamps, and starts a local animation clock.
+   The local clock decides which lyric line should be active.
+
+5. error
+   If microphone permission, recognition, or lyric lookup fails, the app shows an error state.
+
+
+==================================================
+2. IMPORTANT CONSTANTS
+==================================================
+
+These constants define the karaoke timing behavior:
+
+Code:
+const RECORD_SECONDS = 10;
+const SECOND_WINDOW_OFFSET = 1.2;
+const FINE_NUDGE_MS = 100;
+const COARSE_NUDGE_MS = 500;
+const ACTIVE_LINE_PREROLL_MS = 300;
+const AUTO_RESYNC_INTERVAL_MS = 15000;
+const AUTO_RESYNC_CLIP_SECONDS = 3.2;
+const AUTO_RESYNC_DRIFT_THRESHOLD_SEC = 0.15;
+
+Explanation:
+
+RECORD_SECONDS
+How long the first microphone capture lasts before recognition starts.
+
+SECOND_WINDOW_OFFSET
+How far into the clip the second recognition attempt starts.
+The app tries the normal clip and sometimes a second clip shifted by 1.2s.
+
+FINE_NUDGE_MS and COARSE_NUDGE_MS
+Manual sync correction amounts.
+The current UI mostly uses 500ms corrections.
+
+ACTIVE_LINE_PREROLL_MS
+The highlighted lyric is shown 300ms early.
+This is intentional because singers usually need lyrics slightly before the actual vocal.
+
+AUTO_RESYNC_INTERVAL_MS
+Every 15 seconds the app tries to re-check the song position in the background.
+
+AUTO_RESYNC_CLIP_SECONDS
+The background resync capture length.
+
+AUTO_RESYNC_DRIFT_THRESHOLD_SEC
+If the estimated song position differs from the local clock by at least 150ms,
+the app will smoothly correct itself.
+
+
+==================================================
+3. LRC PARSING
+==================================================
+
+Relevant function:
+parseLRC(lrc)
+
+What it does:
+This converts LRCLIB synced lyric text into an array like:
+
+[
+  { time: 12.34, text: "first lyric line" },
+  { time: 16.80, text: "second lyric line" }
+]
+
+Supported formats:
+- [mm:ss]
+- [mm:ss.xx]
+- [mm:ss.xxx]
+- multiple timestamps on the same line
+
+Important detail:
+The parser strips all [timestamp] tags and keeps the remaining text.
+If no text exists it uses "♪".
+
+Why it matters:
+If synced lyrics come in cleanly, karaoke can be accurate.
+If synced lyrics are missing and the app falls back to plain lyrics, timing becomes approximate.
+
+
+==================================================
+4. THE LOADING ANIMATION
+==================================================
+
+Relevant function:
+ShaderLoadingScreen(...)
+
+What it is:
+This is the full-screen animated listening / searching screen.
+It uses Three.js and a fragment shader to render glowing circular wave rings.
+
+How the visual state works:
+
+phase = idle
+- mic icon is shown
+- background glow is calmer
+- waves are mostly at rest
+
+phase = listening
+- mic icon changes to 3 bouncing dots
+- the wave animation responds to live microphone input level
+
+phase = recognizing
+- search icon is shown
+- wave animation is still active, but uses synthetic motion instead of live mic RMS
+
+phase = error
+- wave animation collapses into an error state
+- error text and retry button are shown
+
+Important code behavior:
+
+stateRef.current.appState
+This is the shader state:
+- 0 = idle
+- 1 = active/searching/listening
+- 2 = fail
+
+uniforms.audioLevel
+This drives the wave intensity.
+When listening, it comes from the microphone meter.
+When recognizing, it comes from generated motion so the waves stay alive.
+
+uniforms.playProgress
+This smoothly transitions waves between idle and active mode.
+
+uniforms.stateProgress
+This animates the fail collapse.
+
+How the ring animation works:
+
+The shader creates several circular wave bands.
+For each band it computes:
+- a base radius
+- some chaos / oscillation
+- ripple distortion
+- glow intensity
+
+This is why the rings appear organic rather than perfectly mechanical.
+
+Why the loading waves can feel wrong:
+- If inputLevel is too low, the listening waves may feel dead.
+- If inputLevel is too noisy, the visual may flicker too much.
+- If browser audio permission behaves differently, the input meter may not react as expected.
+
+
+==================================================
+5. LIVE MICROPHONE METER
+==================================================
+
+Relevant functions:
+startLiveMeter(stream)
+stopLiveMeter()
+
+What it does:
+This does not recognize the song.
+It only measures input loudness so the loading animation can react.
+
+How it works:
+
+1. Create AudioContext
+2. Create AnalyserNode
+3. Connect microphone stream to analyser
+4. Read time-domain data every animation frame
+5. Calculate RMS volume
+6. Smooth it into inputLevel state
+
+Important code:
+
+const rms = Math.sqrt(sumSq / arr.length);
+const mapped = Math.min(1, Math.pow(rms * 4.2, 0.9));
+setInputLevel((prev) => prev + (mapped - prev) * 0.08);
+
+Meaning:
+- rms = actual signal energy
+- mapped = boosted and normalized loudness
+- the final line smooths sudden changes
+
+This is why the waves should feel subtle rather than violently jittering.
+
+
+==================================================
+6. THE INITIAL RECORDING PHASE
+==================================================
+
+Relevant function:
+listen()
+
+What it does:
+This is the first real timing anchor step.
+
+Sequence:
+
+1. Increment runId
+   This invalidates any older async request still running.
+
+2. Reset phase and UI state
+   phase = listening
+   progress = 0
+   offset = 0
+   chunks = []
+
+3. Save wall-clock start time
+   recStartWall.current = performance.now()
+
+4. Get microphone
+   With echo cancellation / noise suppression disabled for better recognition.
+
+5. Start live input meter
+
+6. Start MediaRecorder
+   Recorded chunks go into chunks.current
+
+7. After RECORD_SECONDS, stop recording
+
+8. On stop:
+   recEndWall.current = performance.now()
+   recDurationSec.current = actual recorded duration
+   recognize(runId)
+
+Why recStartWall / recEndWall matter:
+They let the app know exactly when recording started and ended in local wall-clock time.
+That matters because recognition finishes later, but the music kept playing meanwhile.
+
+
+==================================================
+7. SONG RECOGNITION
+==================================================
+
+Relevant function:
+recognize(runId)
+
+Goal:
+Figure out:
+- what song is playing
+- what artist it is
+- what time position inside the song the recorded clip matched
+
+Recognition strategy:
+
+Attempt 1:
+- send the original 10s clip
+
+Attempt 2:
+- if possible, decode the clip and create a shifted WAV starting at +1.2s
+- this helps if the beginning of the original clip is noisy or weak
+
+Each attempt sends:
+- file
+- api_token
+- return = lyrics,timecode
+- offset = auddOffsetSec
+
+How best result is chosen:
+The app compares candidate score / confidence and picks the strongest match.
+
+Important line:
+songAtRecEnd.current = timecode + picked.attempt.absoluteEndSec;
+
+This is the key timing anchor.
+
+Meaning:
+
+If AudD says:
+"the clip corresponds to song time 1:19"
+
+and the clip ended 10 seconds after it started,
+then when recording ended the live song was approximately at:
+
+1:19 + 0:10 = 1:29
+
+That becomes the app's estimate for the song position at record end.
+
+Why this can still be wrong:
+- AudD timecode may be slightly off
+- the match may come from a chorus or repeated section
+- loud crowd noise or speech may distort recognition
+- short clips are always approximate
+
+
+==================================================
+8. LYRIC FETCHING
+==================================================
+
+Relevant function:
+fetchLyrics(title, artist, album, auddLyrics, durationSec, runId)
+
+Lookup strategy:
+
+1. LRCLIB /api/get using title + artist (+ album + duration if available)
+2. If result looks weak or has no synced lyrics:
+   search LRCLIB /api/search?q=title artist
+3. Pick the best candidate using title overlap, artist overlap, and duration similarity
+
+If synced lyrics exist:
+- parse them with parseLRC()
+
+If synced lyrics are weak but plain lyrics exist:
+- create fake timestamps every 3.5 seconds
+
+If LRCLIB fails but AudD lyrics exist:
+- also create fake timestamps every 3.5 seconds
+
+If nothing exists:
+- use one fake line: "No synced lyrics found"
+
+Important warning:
+The 3.5-seconds-per-line fallback is not real karaoke sync.
+It is only a visual fallback to avoid an empty screen.
+
+So if a song has only plain lyrics, timing will feel wrong even though the code is technically "working".
+
+
+==================================================
+9. STARTING THE KARAOKE CLOCK
+==================================================
+
+Relevant lines inside fetchLyrics():
+
+const wall = (performance.now() - recEndWall.current) / 1000;
+startTicker(parsed, songAtRecEnd.current + wall);
+
+What this means:
+
+By the time lyrics are fetched:
+- recording has already ended
+- recognition already happened
+- network requests already consumed more time
+- the real song in the room has continued playing
+
+So the app adds "wall" time after recording ended.
+
+Example:
+
+Recording ended at 1:29 in the song
+Recognition + lyric fetch took 2.4 seconds
+
+Then when karaoke begins, the real song should now be around:
+1:29 + 2.4s = 1:31.4
+
+That value is passed into startTicker().
+
+
+==================================================
+10. THE MAIN KARAOKE CLOCK
+==================================================
+
+Relevant function:
+startTicker(ll, fromTime)
+
+This is the most important timing function in the app.
+
+Code idea:
+
+anchor.current = performance.now() - fromTime * 1000;
+
+Then every animation frame:
+
+now = (performance.now() - anchor.current) / 1000;
+
+Meaning:
+anchor is a synthetic "zero point".
+It is set so that if you subtract it from the current time, you get the estimated live song position.
+
+If now = 91.4
+that means the app believes the current song position is 1:31.4.
+
+This is a pure local running clock after the initial lock.
+
+
+==================================================
+11. WHY ACTIVE LYRICS ARE SHOWN EARLY
+==================================================
+
+Relevant line:
+const visualNow = Math.max(0, now + ACTIVE_LINE_PREROLL_MS / 1000);
+
+ACTIVE_LINE_PREROLL_MS = 300
+
+Meaning:
+The highlighted lyric is advanced by 300ms.
+
+If the true song time is 10.0 seconds,
+the lyric comparison uses 10.3 seconds.
+
+Reason:
+Singers want to see the next line slightly before the vocal lands.
+This is standard karaoke behavior.
+
+Without pre-roll:
+- users feel the lyric is late
+
+With too much pre-roll:
+- users feel the lyric is jumping early
+
+So this value is a tuning knob, not an absolute truth.
+
+
+==================================================
+12. HOW THE APP CHOOSES THE ACTIVE LINE
+==================================================
+
+Inside startTicker():
+
+for (let i = L.length - 1; i >= 0; i--) {
+  if (visualNow >= L[i].time) {
+    idx = i;
+    break;
+  }
+}
+
+Explanation:
+The app scans backward through the lyric array and picks the last line whose timestamp is less than or equal to the current visual time.
+
+This means:
+- line N becomes active when visualNow crosses line N's timestamp
+- it stays active until visualNow reaches the next line
+
+This is line-level karaoke, not word-level karaoke.
+
+
+==================================================
+13. AUTO-RESYNC
+==================================================
+
+Relevant functions:
+recordShortClip(seconds)
+autoResync()
+smoothAnchorCorrection(driftSec)
+
+Why it exists:
+The old system only locked once.
+If the initial anchor was off by 500ms, it stayed wrong forever.
+
+The new system self-corrects.
+
+Flow:
+
+1. Every 15 seconds, while in karaoke and playing:
+   autoResync() runs
+
+2. It records a short 3.2 second microphone clip
+
+3. It sends that clip to AudD and asks only for timecode
+
+4. It validates the result:
+   - title overlap must match
+   - artist overlap must match
+   - confidence should not be too weak
+
+5. It estimates the real current song position:
+
+recognizedNow = timecode + clipDurationSec + networkLagSec
+
+Why this formula:
+- timecode = where the clip started in the song
+- clipDurationSec = clip progressed while recording
+- networkLagSec = song continued while the request was in flight
+
+6. It compares that with the local clock:
+
+localNow = (performance.now() - anchor.current) / 1000
+driftSec = recognizedNow - localNow
+
+7. If drift is at least 150ms, it corrects anchor smoothly
+
+Important:
+The correction is smoothed over about 550ms so lyrics do not visibly jump.
+
+That smoothing happens in:
+smoothAnchorCorrection(driftSec)
+
+This is currently the best anti-drift logic in the app.
+
+
+==================================================
+14. MANUAL CONTROLS
+==================================================
+
+jumpTo(index)
+Used when clicking a lyric line.
+It seeks to that line's timestamp.
+
+seekToTime(timeSec)
+Used by the progress bar.
+This is exact-time seeking.
+It does not snap to the nearest lyric line anymore.
+
+nudge(ms)
+This shifts anchor.current directly.
+
+Important nudge behavior:
+
+if (anchor.current != null) anchor.current += ms;
+
+If anchor increases, elapsed song time becomes slightly smaller.
+That effectively pushes lyrics later.
+
+If anchor decreases, elapsed song time becomes slightly larger.
+That effectively pulls lyrics earlier.
+
+
+==================================================
+15. THE KARAOKE PAGE ANIMATION
+==================================================
+
+Relevant function:
+KaraokePage(...)
+
+This page has two major visual systems:
+
+1. Left music card
+   Album art, title, artist, play/pause, progress, nudges
+
+2. Right lyric field
+   Large text that scales, fades, and scrolls according to activeIdx
+
+Lyric motion logic:
+
+Active line:
+- full opacity
+- larger scale
+- stronger glow
+
+Past lines:
+- lower opacity
+- slight blur
+- slight upward translation
+
+Future lines:
+- lower opacity
+- slight downward translation
+
+Auto-scroll:
+Whenever activeIdx changes, the corresponding element scrolls into view using:
+scrollIntoView({ behavior: "smooth", block: "center" })
+
+This means the animation is not just CSS.
+There is also programmatic scrolling tied to timing state.
+
+
+==================================================
+16. WHY SOMETHING MAY STILL FEEL "NOT WORKING"
+==================================================
+
+These are the most likely real failure points:
+
+1. The song match is correct, but LRCLIB only has plain lyrics
+Result:
+Timing looks wrong because fake 3.5 second spacing is being used.
+
+2. AudD matched the correct song but a repeated chorus section
+Result:
+The anchor starts at the wrong point in the song.
+
+3. Recognition latency varies too much
+Result:
+Even though "wall" time is added, the real live song may still not align perfectly.
+
+4. Background resync may fail silently
+Reasons:
+- microphone access blocked again
+- resync clip too quiet
+- AudD gives no result
+- confidence too low
+
+5. The song in the room is not the exact studio version
+Examples:
+- live recording
+- remix
+- sped-up version
+- social-media edit
+Result:
+Lyrics and timecodes may never align correctly.
+
+6. Plain lyrics fallback looks like karaoke but is not synchronized
+This is the biggest "it shows lyrics but they are wrong" trap.
+
+7. Pre-roll may feel too early for some users
+Current value:
+300ms early
+
+8. Auto-resync can only correct when the recognition provider returns a valid timecode
+If timecode is unstable, background correction cannot help much.
+
+
+==================================================
+17. WHAT IS CURRENTLY GOOD
+==================================================
+
+These parts are solid:
+
+- One-shot anchor from song recognition
+- Extra shifted recognition attempt
+- Wall-time compensation after recording
+- Pre-roll highlighting
+- Exact-time progress seek
+- Background re-sync loop
+- Smooth anchor correction instead of hard jumps
+- Run ID protection against stale async results
+
+
+==================================================
+18. WHAT IS STILL WEAK
+==================================================
+
+These parts are still weak from an accuracy perspective:
+
+- Line-level sync only
+- No word-level highlighting
+- Fake plain-lyric timing fallback
+- Reliance on third-party timecode quality
+- Resync still uses another recognition call instead of a continuous position tracker
+
+
+==================================================
+19. WHAT TO TELL AN EXPERT REVIEWER
+==================================================
+
+If you want an expert to review this, tell them:
+
+"The main karaoke timing logic is in karaoke-listen-app.tsx. Please inspect:
+- listen()
+- recognize()
+- fetchLyrics()
+- autoResync()
+- startTicker()
+- KaraokePage lyric rendering
+
+I need you to verify:
+- whether the anchor math is correct
+- whether AudD timecode is being interpreted correctly
+- whether wall-clock compensation is enough
+- whether background resync should use a different formula
+- whether plain-lyric fallback should be replaced with forced alignment
+- whether line highlight should be per-word instead of per-line"
+
+
+==================================================
+20. FAST DEBUG CHECKLIST
+==================================================
+
+If karaoke timing looks wrong for a specific song:
+
+1. Check if synced lyrics actually exist from LRCLIB
+2. Check if the app is using real synced timestamps or fake 3.5s fallback
+3. Check the AudD returned timecode
+4. Compare syncNote shown in UI with expected song position
+5. See whether auto-resync is actually correcting drift
+6. Test with a clean official studio version, not a remix or live version
+
+
+==================================================
+21. MOST IMPORTANT SUMMARY
+==================================================
+
+The karaoke timing currently works like this:
+
+1. Record 10s of audio
+2. Recognize song and get timecode
+3. Estimate song position at recording end
+4. Add wall-clock delay while lyrics are loading
+5. Start a local clock anchored to that estimated song position
+6. Pre-roll lyric display by 300ms
+7. Re-check song position every 15s
+8. Smoothly correct the local clock if drift is large enough
+
+If it still feels wrong, the most likely cause is not the animation.
+The most likely cause is:
+- incorrect or missing synced lyrics
+- imperfect recognition timecode
+- wrong song version
+- plain-lyrics fallback pretending to be synced karaoke
+
+
+End of document.
