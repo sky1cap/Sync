@@ -1,0 +1,1 @@
+(globalThis.TURBOPACK||(globalThis.TURBOPACK=[])).push(["object"==typeof document?document.currentScript:void 0,63606,e=>{"use strict";var r=e.i(71645);function t(){return(0,r.useEffect)(()=>{"serviceWorker"in navigator&&(async()=>{try{await navigator.serviceWorker.register("/sw.js",{scope:"/"})}catch{}})()},[]),null}e.s(["PwaRegister",()=>t])}]);
